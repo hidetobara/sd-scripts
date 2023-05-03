@@ -6,3 +6,7 @@ venv
 build
 .vscode
 wandb
+
+data/
+out/
+*.out

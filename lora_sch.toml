@@ -1,0 +1,18 @@
+[general]
+enable_bucket = true                        # Aspect Ratio Bucketingを使うか否か
+
+[[datasets]]
+resolution = 512                            # 学習解像度
+batch_size = 5                              # バッチサイズ
+
+  [[datasets.subsets]]
+  image_dir = '/app/data/sch'                     # 学習用画像を入れたフォルダを指定
+  class_tokens = 'sch english cafe'                # identifier class を指定
+  num_repeats = 15                          # 学習用画像の繰り返し回数
+
+  # 以下は正則化画像を用いる場合のみ記述する。用いない場合は削除する
+#  [[datasets.subsets]]
+#  is_reg = true
+#  image_dir = 'C:\reg'                      # 正則化画像を入れたフォルダを指定
+#  class_tokens = 'girl'                     # class を指定
+#  num_repeats = 1                           # 正則化画像の繰り返し回数、基本的には1でよい
