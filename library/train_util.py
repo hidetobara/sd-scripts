@@ -19,6 +19,7 @@ from typing import (
     Union,
 )
 from accelerate import Accelerator
+import gc
 import glob
 import math
 import os
@@ -30,6 +31,7 @@ import toml
 
 from tqdm import tqdm
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
 from transformers import CLIPTokenizer
@@ -73,6 +75,11 @@ EPOCH_DIFFUSERS_DIR_NAME = "{}-{:06d}"
 LAST_STATE_NAME = "{}-state"
 DEFAULT_EPOCH_NAME = "epoch"
 DEFAULT_LAST_OUTPUT_NAME = "last"
+
+DEFAULT_STEP_NAME = "at"
+STEP_STATE_NAME = "{}-step{:08d}-state"
+STEP_FILE_NAME = "{}-step{:08d}"
+STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 # region dataset
 
@@ -1878,7 +1885,7 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation, AdaFactor",
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, Lion, Lion8bit,SGDNesterov, SGDNesterov8bit, DAdaptation, AdaFactor",
     )
 
     # backward compatibility
@@ -1987,17 +1994,37 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--save_every_n_epochs", type=int, default=None, help="save checkpoint every N epochs / 学習中のモデルを指定エポックごとに保存する"
     )
     parser.add_argument(
+        "--save_every_n_steps", type=int, default=None, help="save checkpoint every N steps / 学習中のモデルを指定ステップごとに保存する"
+    )
+    parser.add_argument(
         "--save_n_epoch_ratio",
         type=int,
         default=None,
         help="save checkpoint N epoch ratio (for example 5 means save at least 5 files total) / 学習中のモデルを指定のエポック割合で保存する（たとえば5を指定すると最低5個のファイルが保存される）",
     )
-    parser.add_argument("--save_last_n_epochs", type=int, default=None, help="save last N checkpoints / 最大Nエポック保存する")
+    parser.add_argument(
+        "--save_last_n_epochs",
+        type=int,
+        default=None,
+        help="save last N checkpoints when saving every N epochs (remove older checkpoints) / 指定エポックごとにモデルを保存するとき最大Nエポック保存する（古いチェックポイントは削除する）",
+    )
     parser.add_argument(
         "--save_last_n_epochs_state",
         type=int,
         default=None,
-        help="save last N checkpoints of state (overrides the value of --save_last_n_epochs)/ 最大Nエポックstateを保存する(--save_last_n_epochsの指定を上書きします)",
+        help="save last N checkpoints of state (overrides the value of --save_last_n_epochs)/ 最大Nエポックstateを保存する（--save_last_n_epochsの指定を上書きする）",
+    )
+    parser.add_argument(
+        "--save_last_n_steps",
+        type=int,
+        default=None,
+        help="save checkpoints until N steps elapsed (remove older checkpoints if N steps elapsed) / 指定ステップごとにモデルを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する）",
+    )
+    parser.add_argument(
+        "--save_last_n_steps_state",
+        type=int,
+        default=None,
+        help="save states until N steps elapsed (remove older states if N steps elapsed, overrides --save_last_n_steps) / 指定ステップごとにstateを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する。--save_last_n_stepsを上書きする）",
     )
     parser.add_argument(
         "--save_state",
@@ -2095,6 +2122,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="enable noise offset with this value (if enabled, around 0.1 is recommended) / Noise offsetを有効にしてこの値を設定する（有効にする場合は0.1程度を推奨）",
     )
     parser.add_argument(
+        "--multires_noise_iterations",
+        type=int,
+        default=None,
+        help="enable multires noise with this number of iterations (if enabled, around 6-10 is recommended) / Multires noiseを有効にしてこのイテレーション数を設定する（有効にする場合は6-10程度を推奨）"
+    )
+    parser.add_argument(
+        "--multires_noise_discount",
+        type=float,
+        default=0.3,
+        help="set discount value for multires noise (has no effect without --multires_noise_iterations) / Multires noiseのdiscount値を設定する（--multires_noise_iterations指定時のみ有効）",
+    )
+    parser.add_argument(
         "--lowram",
         action="store_true",
         help="enable low RAM optimization. e.g. load models to VRAM instead of RAM (for machines which have bigger VRAM than RAM such as Colab and Kaggle) / メインメモリが少ない環境向け最適化を有効にする。たとえばVRAMにモデルを読み込むなど（ColabやKaggleなどRAMに比べてVRAMが多い環境向け）",
@@ -2159,6 +2198,12 @@ def verify_training_args(args: argparse.Namespace):
         print("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
     if args.v2 and args.clip_skip is not None:
         print("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
+
+    if args.cache_latents_to_disk and not args.cache_latents:
+        args.cache_latents = True
+        print(
+            "cache_latents_to_disk is enabled, so cache_latents is also enabled / cache_latents_to_diskが有効なため、cache_latentsを有効にします"
+        )
 
 
 def add_dataset_arguments(
@@ -2417,7 +2462,7 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
 
 
 def get_optimizer(args, trainable_params):
-    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation, Adafactor"
+    # "Optimizer to use: AdamW, AdamW8bit, Lion, Lion8bit, SGDNesterov, SGDNesterov8bit, DAdaptation, Adafactor"
 
     optimizer_type = args.optimizer_type
     if args.use_8bit_adam:
@@ -2493,6 +2538,22 @@ def get_optimizer(args, trainable_params):
             raise ImportError("No lion_pytorch / lion_pytorch がインストールされていないようです")
         print(f"use Lion optimizer | {optimizer_kwargs}")
         optimizer_class = lion_pytorch.Lion
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Lion8bit".lower():
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+
+        print(f"use 8-bit Lion optimizer | {optimizer_kwargs}")
+        try:
+            optimizer_class = bnb.optim.Lion8bit
+        except AttributeError:
+            raise AttributeError(
+                "No Lion8bit. The version of bitsandbytes installed seems to be old. Please install 0.38.0 or later. / Lion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.38.0以上をインストールしてください"
+            )
+
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "SGDNesterov".lower():
@@ -2819,7 +2880,7 @@ def prepare_dtype(args: argparse.Namespace):
     return weight_dtype, save_dtype
 
 
-def load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
+def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
     name_or_path = args.pretrained_model_name_or_path
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
@@ -2844,6 +2905,36 @@ def load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
     if args.vae is not None:
         vae = model_util.load_vae(args.vae, weight_dtype)
         print("additional VAE loaded")
+
+    return text_encoder, vae, unet, load_stable_diffusion_format
+
+
+def transform_if_model_is_DDP(text_encoder, unet, network=None):
+    # Transform text_encoder, unet and network from DistributedDataParallel
+    return (model.module if type(model) == DDP else model for model in [text_encoder, unet, network] if model is not None)
+
+
+def load_target_model(args, weight_dtype, accelerator):
+    # load models for each process
+    for pi in range(accelerator.state.num_processes):
+        if pi == accelerator.state.local_process_index:
+            print(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
+
+            text_encoder, vae, unet, load_stable_diffusion_format = _load_target_model(
+                args, weight_dtype, accelerator.device if args.lowram else "cpu"
+            )
+
+            # work on low-ram device
+            if args.lowram:
+                text_encoder.to(accelerator.device)
+                unet.to(accelerator.device)
+                vae.to(accelerator.device)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+
+    text_encoder, unet = transform_if_model_is_DDP(text_encoder, unet)
 
     return text_encoder, vae, unet, load_stable_diffusion_format
 
@@ -2903,26 +2994,53 @@ def get_hidden_states(args: argparse.Namespace, input_ids, tokenizer, text_encod
     return encoder_hidden_states
 
 
-def get_epoch_ckpt_name(args: argparse.Namespace, use_safetensors, epoch):
-    model_name = DEFAULT_EPOCH_NAME if args.output_name is None else args.output_name
-    ckpt_name = EPOCH_FILE_NAME.format(model_name, epoch) + (".safetensors" if use_safetensors else ".ckpt")
-    return model_name, ckpt_name
+def default_if_none(value, default):
+    return default if value is None else value
 
 
-def save_on_epoch_end(args: argparse.Namespace, save_func, remove_old_func, epoch_no: int, num_train_epochs: int):
-    saving = epoch_no % args.save_every_n_epochs == 0 and epoch_no < num_train_epochs
-    if saving:
-        os.makedirs(args.output_dir, exist_ok=True)
-        save_func()
-
-        if args.save_last_n_epochs is not None:
-            remove_epoch_no = epoch_no - args.save_every_n_epochs * args.save_last_n_epochs
-            remove_old_func(remove_epoch_no)
-    return saving
+def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int):
+    model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
+    return EPOCH_FILE_NAME.format(model_name, epoch_no) + ext
 
 
-def save_sd_model_on_epoch_end(
+def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int):
+    model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
+    return STEP_FILE_NAME.format(model_name, step_no) + ext
+
+
+def get_last_ckpt_name(args: argparse.Namespace, ext: str):
+    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
+    return model_name + ext
+
+
+def get_remove_epoch_no(args: argparse.Namespace, epoch_no: int):
+    if args.save_last_n_epochs is None:
+        return None
+
+    remove_epoch_no = epoch_no - args.save_every_n_epochs * args.save_last_n_epochs
+    if remove_epoch_no < 0:
+        return None
+    return remove_epoch_no
+
+
+def get_remove_step_no(args: argparse.Namespace, step_no: int):
+    if args.save_last_n_steps is None:
+        return None
+
+    # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
+    # save_every_n_steps=10, save_last_n_steps=30の場合、50step目には30step分残し、10step目を削除する
+    remove_step_no = step_no - args.save_last_n_steps - 1
+    remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
+    if remove_step_no < 0:
+        return None
+    return remove_step_no
+
+
+# epochとstepの保存、メタデータにepoch/stepが含まれ引数が同じになるため、統合している
+# on_epoch_end: Trueならepoch終了時、Falseならstep経過時
+def save_sd_model_on_epoch_end_or_stepwise(
     args: argparse.Namespace,
+    on_epoch_end: bool,
     accelerator,
     src_path: str,
     save_stable_diffusion_format: bool,
@@ -2935,57 +3053,87 @@ def save_sd_model_on_epoch_end(
     unet,
     vae,
 ):
-    epoch_no = epoch + 1
-    model_name, ckpt_name = get_epoch_ckpt_name(args, use_safetensors, epoch_no)
+    if on_epoch_end:
+        epoch_no = epoch + 1
+        saving = epoch_no % args.save_every_n_epochs == 0 and epoch_no < num_train_epochs
+        if not saving:
+            return
 
-    if save_stable_diffusion_format:
-
-        def save_sd():
-            ckpt_file = os.path.join(args.output_dir, ckpt_name)
-            print(f"saving checkpoint: {ckpt_file}")
-            model_util.save_stable_diffusion_checkpoint(
-                args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, save_dtype, vae
-            )
-            if args.huggingface_repo_id is not None:
-                huggingface_util.upload(args, ckpt_file, "/" + ckpt_name)
-
-        def remove_sd(old_epoch_no):
-            _, old_ckpt_name = get_epoch_ckpt_name(args, use_safetensors, old_epoch_no)
-            old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-            if os.path.exists(old_ckpt_file):
-                print(f"removing old checkpoint: {old_ckpt_file}")
-                os.remove(old_ckpt_file)
-
-        save_func = save_sd
-        remove_old_func = remove_sd
+        model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
+        remove_no = get_remove_epoch_no(args, epoch_no)
     else:
+        # 保存するか否かは呼び出し側で判断済み
 
-        def save_du():
+        model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
+        epoch_no = epoch  # 例: 最初のepochの途中で保存したら0になる、SDモデルに保存される
+        remove_no = get_remove_step_no(args, global_step)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    if save_stable_diffusion_format:
+        ext = ".safetensors" if use_safetensors else ".ckpt"
+
+        if on_epoch_end:
+            ckpt_name = get_epoch_ckpt_name(args, ext, epoch_no)
+        else:
+            ckpt_name = get_step_ckpt_name(args, ext, global_step)
+
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        print(f"saving checkpoint: {ckpt_file}")
+        model_util.save_stable_diffusion_checkpoint(
+            args.v2, ckpt_file, text_encoder, unet, src_path, epoch_no, global_step, save_dtype, vae
+        )
+
+        if args.huggingface_repo_id is not None:
+            huggingface_util.upload(args, ckpt_file, "/" + ckpt_name)
+
+        # remove older checkpoints
+        if remove_no is not None:
+            if on_epoch_end:
+                remove_ckpt_name = get_epoch_ckpt_name(args, ext, remove_no)
+            else:
+                remove_ckpt_name = get_step_ckpt_name(args, ext, remove_no)
+
+            remove_ckpt_file = os.path.join(args.output_dir, remove_ckpt_name)
+            if os.path.exists(remove_ckpt_file):
+                print(f"removing old checkpoint: {remove_ckpt_file}")
+                os.remove(remove_ckpt_file)
+
+    else:
+        if on_epoch_end:
             out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, epoch_no))
-            print(f"saving model: {out_dir}")
-            os.makedirs(out_dir, exist_ok=True)
-            model_util.save_diffusers_checkpoint(
-                args.v2, out_dir, text_encoder, unet, src_path, vae=vae, use_safetensors=use_safetensors
-            )
-            if args.huggingface_repo_id is not None:
-                huggingface_util.upload(args, out_dir, "/" + model_name)
+        else:
+            out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, global_step))
 
-        def remove_du(old_epoch_no):
-            out_dir_old = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, old_epoch_no))
-            if os.path.exists(out_dir_old):
-                print(f"removing old model: {out_dir_old}")
-                shutil.rmtree(out_dir_old)
+        print(f"saving model: {out_dir}")
+        model_util.save_diffusers_checkpoint(
+            args.v2, out_dir, text_encoder, unet, src_path, vae=vae, use_safetensors=use_safetensors
+        )
+        if args.huggingface_repo_id is not None:
+            huggingface_util.upload(args, out_dir, "/" + model_name)
 
-        save_func = save_du
-        remove_old_func = remove_du
+        # remove older checkpoints
+        if remove_no is not None:
+            if on_epoch_end:
+                remove_out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+            else:
+                remove_out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
 
-    saving = save_on_epoch_end(args, save_func, remove_old_func, epoch_no, num_train_epochs)
-    if saving and args.save_state:
-        save_state_on_epoch_end(args, accelerator, model_name, epoch_no)
+            if os.path.exists(remove_out_dir):
+                print(f"removing old model: {remove_out_dir}")
+                shutil.rmtree(remove_out_dir)
+
+    if on_epoch_end:
+        save_and_remove_state_on_epoch_end(args, accelerator, epoch_no)
+    else:
+        save_and_remove_state_stepwise(args, accelerator, global_step)
 
 
-def save_state_on_epoch_end(args: argparse.Namespace, accelerator, model_name, epoch_no):
-    print("saving state.")
+def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator, epoch_no):
+    model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
+
+    print(f"saving state at epoch {epoch_no}")
+    os.makedirs(args.output_dir, exist_ok=True)
+
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
     if args.save_state_to_huggingface:
@@ -3001,12 +3149,40 @@ def save_state_on_epoch_end(args: argparse.Namespace, accelerator, model_name, e
             shutil.rmtree(state_dir_old)
 
 
+def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_no):
+    model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
+
+    print(f"saving state at step {step_no}")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
+    accelerator.save_state(state_dir)
+    if args.save_state_to_huggingface:
+        print("uploading state to huggingface.")
+        huggingface_util.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
+
+    last_n_steps = args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps
+    if last_n_steps is not None:
+        # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
+        remove_step_no = step_no - last_n_steps - 1
+        remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
+
+        if remove_step_no > 0:
+            state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
+            if os.path.exists(state_dir_old):
+                print(f"removing old state: {state_dir_old}")
+                shutil.rmtree(state_dir_old)
+
+
 def save_state_on_train_end(args: argparse.Namespace, accelerator):
+    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
+
     print("saving last state.")
     os.makedirs(args.output_dir, exist_ok=True)
-    model_name = DEFAULT_LAST_OUTPUT_NAME if args.output_name is None else args.output_name
+
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
+
     if args.save_state_to_huggingface:
         print("uploading last state to huggingface.")
         huggingface_util.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
@@ -3024,7 +3200,7 @@ def save_sd_model_on_train_end(
     unet,
     vae,
 ):
-    model_name = DEFAULT_LAST_OUTPUT_NAME if args.output_name is None else args.output_name
+    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
 
     if save_stable_diffusion_format:
         os.makedirs(args.output_dir, exist_ok=True)

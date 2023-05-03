@@ -1,4 +1,3 @@
-from torch.nn.parallel import DistributedDataParallel as DDP
 import importlib
 import argparse
 import gc
@@ -26,7 +25,7 @@ from library.config_util import (
 )
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
-from library.custom_train_functions import apply_snr_weight, get_weighted_text_embeddings
+from library.custom_train_functions import apply_snr_weight, get_weighted_text_embeddings, pyramid_noise_like
 
 
 # TODO 他のスクリプトと共通化する
@@ -144,24 +143,7 @@ def train(args):
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
 
     # モデルを読み込む
-    for pi in range(accelerator.state.num_processes):
-        # TODO: modify other training scripts as well
-        if pi == accelerator.state.local_process_index:
-            print(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
-
-            text_encoder, vae, unet, _ = train_util.load_target_model(
-                args, weight_dtype, accelerator.device if args.lowram else "cpu"
-            )
-
-            # work on low-ram device
-            if args.lowram:
-                text_encoder.to(accelerator.device)
-                unet.to(accelerator.device)
-                vae.to(accelerator.device)
-
-            gc.collect()
-            torch.cuda.empty_cache()
-        accelerator.wait_for_everyone()
+    text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # モデルに xformers とか memory efficient attention を組み込む
     train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers)
@@ -279,6 +261,9 @@ def train(args):
     else:
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
 
+    # transform DDP after prepare (train_network here only)
+    text_encoder, unet, network = train_util.transform_if_model_is_DDP(text_encoder, unet, network)
+
     unet.requires_grad_(False)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.requires_grad_(False)
@@ -288,20 +273,11 @@ def train(args):
         text_encoder.train()
 
         # set top parameter requires_grad = True for gradient checkpointing works
-        if type(text_encoder) == DDP:
-            text_encoder.module.text_model.embeddings.requires_grad_(True)
-        else:
-            text_encoder.text_model.embeddings.requires_grad_(True)
+        text_encoder.text_model.embeddings.requires_grad_(True)
     else:
         unet.eval()
         text_encoder.eval()
-
-    # support DistributedDataParallel
-    if type(text_encoder) == DDP:
-        text_encoder = text_encoder.module
-        unet = unet.module
-        network = network.module
-
+        
     network.prepare_grad_etc(text_encoder, unet)
 
     if not cache_latents:
@@ -366,6 +342,8 @@ def train(args):
         "ss_seed": args.seed,
         "ss_lowram": args.lowram,
         "ss_noise_offset": args.noise_offset,
+        "ss_multires_noise_iterations": args.multires_noise_iterations,
+        "ss_multires_noise_discount": args.multires_noise_discount,
         "ss_training_comment": args.training_comment,  # will not be updated after training
         "ss_sd_scripts_commit_hash": train_util.get_git_revision_hash(),
         "ss_optimizer": optimizer_name + (f"({optimizer_args})" if len(optimizer_args) > 0 else ""),
@@ -549,6 +527,27 @@ def train(args):
     # else:
     #     on_step_start = lambda *args, **kwargs: None
 
+    # function for saving/removing
+    def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+
+        print(f"saving checkpoint: {ckpt_file}")
+        metadata["ss_training_finished_at"] = str(time.time())
+        metadata["ss_steps"] = str(steps)
+        metadata["ss_epoch"] = str(epoch_no)
+
+        unwrapped_nw.save_weights(ckpt_file, save_dtype, minimum_metadata if args.no_metadata else metadata)
+        if args.huggingface_repo_id is not None:
+            huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
+
+    def remove_model(old_ckpt_name):
+        old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
+        if os.path.exists(old_ckpt_file):
+            print(f"removing old checkpoint: {old_ckpt_file}")
+            os.remove(old_ckpt_file)
+
+    # training loop
     for epoch in range(num_train_epochs):
         if is_main_process:
             print(f"epoch {epoch+1}/{num_train_epochs}")
@@ -591,6 +590,8 @@ def train(args):
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn((latents.shape[0], latents.shape[1], 1, 1), device=latents.device)
+                elif args.multires_noise_iterations:
+                    noise = pyramid_noise_like(noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount)
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b_size,), device=latents.device)
@@ -638,6 +639,21 @@ def train(args):
                     accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet
                 )
 
+                # 指定ステップごとにモデルを保存
+                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                        save_model(ckpt_name, unwrap_model(network), global_step, epoch)
+
+                        if args.save_state:
+                            train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                        remove_step_no = train_util.get_remove_step_no(args, global_step)
+                        if remove_step_no is not None:
+                            remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                            remove_model(remove_ckpt_name)
+
             current_loss = loss.detach().item()
             if epoch == 0:
                 loss_list.append(current_loss)
@@ -662,35 +678,26 @@ def train(args):
 
         accelerator.wait_for_everyone()
 
+        # 指定エポックごとにモデルを保存
         if args.save_every_n_epochs is not None:
-            model_name = train_util.DEFAULT_EPOCH_NAME if args.output_name is None else args.output_name
+            saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
+            if is_main_process and saving:
+                ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
+                save_model(ckpt_name, unwrap_model(network), global_step, epoch + 1)
 
-            def save_func():
-                ckpt_name = train_util.EPOCH_FILE_NAME.format(model_name, epoch + 1) + "." + args.save_model_as
-                ckpt_file = os.path.join(args.output_dir, ckpt_name)
-                metadata["ss_training_finished_at"] = str(time.time())
-                print(f"saving checkpoint: {ckpt_file}")
-                unwrap_model(network).save_weights(ckpt_file, save_dtype, minimum_metadata if args.no_metadata else metadata)
-                if args.huggingface_repo_id is not None:
-                    huggingface_util.upload(args, ckpt_file, "/" + ckpt_name)
+                remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
+                if remove_epoch_no is not None:
+                    remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
+                    remove_model(remove_ckpt_name)
 
-            def remove_old_func(old_epoch_no):
-                old_ckpt_name = train_util.EPOCH_FILE_NAME.format(model_name, old_epoch_no) + "." + args.save_model_as
-                old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
-                if os.path.exists(old_ckpt_file):
-                    print(f"removing old checkpoint: {old_ckpt_file}")
-                    os.remove(old_ckpt_file)
-
-            if is_main_process:
-                saving = train_util.save_on_epoch_end(args, save_func, remove_old_func, epoch + 1, num_train_epochs)
-                if saving and args.save_state:
-                    train_util.save_state_on_epoch_end(args, accelerator, model_name, epoch + 1)
+                if args.save_state:
+                    train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
         train_util.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
         # end of epoch
 
-    metadata["ss_epoch"] = str(num_train_epochs)
+    # metadata["ss_epoch"] = str(num_train_epochs)
     metadata["ss_training_finished_at"] = str(time.time())
 
     if is_main_process:
@@ -698,22 +705,15 @@ def train(args):
 
     accelerator.end_training()
 
-    if args.save_state:
+    if is_main_process and args.save_state:
         train_util.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
 
     if is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-        model_name = train_util.DEFAULT_LAST_OUTPUT_NAME if args.output_name is None else args.output_name
-        ckpt_name = model_name + "." + args.save_model_as
-        ckpt_file = os.path.join(args.output_dir, ckpt_name)
-
-        print(f"save trained model to {ckpt_file}")
-        network.save_weights(ckpt_file, save_dtype, minimum_metadata if args.no_metadata else metadata)
-        if args.huggingface_repo_id is not None:
-            huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=True)
+        ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
+        save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+        
         print("model saved.")
 
 

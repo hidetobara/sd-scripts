@@ -26,10 +26,11 @@ The scripts are tested with PyTorch 1.12.1 and 1.13.0, Diffusers 0.10.2.
 
 ## Links to how-to-use documents
 
-All documents are in Japanese currently.
+Most of the documents are written in Japanese.
 
-* [Training guide - common](./train_README-ja.md) : data preparation, options etc...
-    * [Dataset config](./config_README-ja.md)
+* [Training guide - common](./train_README-ja.md) : data preparation, options etc... 
+  * [Chinese version](./train_README-zh.md)
+* [Dataset config](./config_README-ja.md) 
 * [DreamBooth training guide](./train_db_README-ja.md)
 * [Step by Step fine-tuning guide](./fine_tune_README_ja.md):
 * [training LoRA](./train_network_README-ja.md)
@@ -96,6 +97,16 @@ note: Some user reports ``ValueError: fp16 mixed precision requires a GPU`` is o
 Other versions of PyTorch and xformers seem to have problems with training.
 If there is no other reason, please install the specified version.
 
+### Optional: Use Lion8bit
+
+For Lion8bit, you need to upgrade `bitsandbytes` to 0.38.0 or later. Uninstall `bitsandbytes`, and for Windows, install the Windows version whl file from [here](https://github.com/jllllll/bitsandbytes-windows-webui) or other sources, like:
+
+```powershell
+pip install https://github.com/jllllll/bitsandbytes-windows-webui/raw/main/bitsandbytes-0.38.1-py3-none-any.whl
+```
+
+For upgrading, upgrade this repo with `pip install .`, and upgrade necessary packages manually.
+
 ## Upgrade
 
 When a new release comes out you can upgrade your repo with the following command:
@@ -127,36 +138,65 @@ The majority of scripts is licensed under ASL 2.0 (including codes from Diffuser
 
 ## Change History
 
-### 23 Apr. 2023, 2023/4/23:
+### 3 May 2023, 2023/05/03
 
-- Fixed to log to TensorBoard when `--logging_dir` is specified and `--log_with` is not specified.
-- `--logging_dir`を指定し`--log_with`を指定しない場合に、以前と同様にTensorBoardへログ出力するよう修正しました。
+-  When saving v2 models in Diffusers format in training scripts and conversion scripts, it was found that the U-Net configuration is different from those of Hugging Face's stabilityai models (this repository is `"use_linear_projection": false`, stabilityai is `true`). Please note that the weight shapes are different, so please be careful when using the weight files directly. We apologize for the inconvenience.
+    - Since the U-Net model is created based on the configuration, it should not cause any problems in training or inference.
+    - Added `--unet_use_linear_projection` option to `convert_diffusers20_original_sd.py` script. If you specify this option, you can save a Diffusers format model with the same configuration as stabilityai's model from an SD format model (a single `*.safetensors` or `*.ckpt` file). Unfortunately, it is not possible to convert a Diffusers format model to the same format.
 
-### 22 Apr. 2023, 2023/4/22:
+- Lion8bit optimizer is supported. [PR #447](https://github.com/kohya-ss/sd-scripts/pull/447) Thanks to sdbds!
+  - Currently it is optional because you need to update `bitsandbytes` version. See "Optional: Use Lion8bit" in installation instructions to use it.
+- Multi-GPU training with DDP is supported in each training script. [PR #448](https://github.com/kohya-ss/sd-scripts/pull/448) Thanks to Isotr0py!
+- Multi resolution noise (pyramid noise) is supported in each training script. [PR #471](https://github.com/kohya-ss/sd-scripts/pull/471) Thanks to pamparamm!
+  - See PR and this page [Multi-Resolution Noise for Diffusion Model Training](https://wandb.ai/johnowhitaker/multires_noise/reports/Multi-Resolution-Noise-for-Diffusion-Model-Training--VmlldzozNjYyOTU2) for details.
 
-- Added support for logging to wandb. Please refer to [PR #428](https://github.com/kohya-ss/sd-scripts/pull/428). Thank you p1atdev!
-  - `wandb` installation is required. Please install it with `pip install wandb`. Login to wandb with `wandb login` command, or set `--wandb_api_key` option for automatic login.
-  - Please let me know if you find any bugs as the test is not complete. 
-- You can automatically login to wandb by setting the `--wandb_api_key` option. Please be careful with the handling of API Key. [PR #435](https://github.com/kohya-ss/sd-scripts/pull/435) Thank you Linaqruf!
+- 学習スクリプトや変換スクリプトでDiffusers形式でv2モデルを保存するとき、U-Netの設定がHugging Faceのstabilityaiのモデルと異なることがわかりました（当リポジトリでは `"use_linear_projection": false`、stabilityaiは`true`）。重みの形状が異なるため、直接重みファイルを利用する場合にはご注意ください。ご不便をお掛けし申し訳ありません。
+  - U-Netのモデルは設定に基づいて作成されるため、通常、学習や推論で問題になることはないと思われます。
+  - `convert_diffusers20_original_sd.py`スクリプトに`--unet_use_linear_projection`オプションを追加しました。これを指定するとSD形式のモデル（単一の`*.safetensors`または`*.ckpt`ファイル）から、stabilityaiのモデルと同じ形状の重みファイルを持つDiffusers形式モデルが保存できます。なお、Diffusers形式のモデルを同形式に変換することはできません。
 
-- Improved the behavior of `--debug_dataset` on non-Windows environments. [PR #429](https://github.com/kohya-ss/sd-scripts/pull/429) Thank you tsukimiya!
-- Fixed `--face_crop_aug` option not working in Fine tuning method.
-- Prepared code to use any upscaler in `gen_img_diffusers.py`.
+- Lion8bitオプティマイザがサポートされました。[PR #447](https://github.com/kohya-ss/sd-scripts/pull/447) sdbds氏に感謝します。
+  - `bitsandbytes`のバージョンを更新する必要があるため、現在はオプションです。使用するにはインストール手順の「[オプション：Lion8bitを使う](./README-ja.md#オプションlion8bitを使う)」を参照してください。
+- 各学習スクリプトでDDPによるマルチGPU学習がサポートされました。[PR #448](https://github.com/kohya-ss/sd-scripts/pull/448) Isotr0py氏に感謝します。
+- Multi resolution noise (pyramid noise) が各学習スクリプトでサポートされました。[PR #471](https://github.com/kohya-ss/sd-scripts/pull/471) pamparamm氏に感謝します。
+  - 詳細はPRおよびこちらのページ [Multi-Resolution Noise for Diffusion Model Training](https://wandb.ai/johnowhitaker/multires_noise/reports/Multi-Resolution-Noise-for-Diffusion-Model-Training--VmlldzozNjYyOTU2) を参照してください。
 
-- wandbへのロギングをサポートしました。詳細は [PR #428](https://github.com/kohya-ss/sd-scripts/pull/428)をご覧ください。p1atdev氏に感謝します。
-  - `wandb` のインストールが別途必要です。`pip install wandb` でインストールしてください。また `wandb login` でログインしてください（学習スクリプト内でログインする場合は `--wandb_api_key` オプションを設定してください）。
-  - テスト未了のため不具合等ありましたらご連絡ください。
-- wandbへのロギング時に `--wandb_api_key` オプションを設定することで自動ログインできます。API Keyの扱いにご注意ください。 [PR #435](https://github.com/kohya-ss/sd-scripts/pull/435) Linaqruf氏に感謝します。
+### 30 Apr. 2023, 2023/04/30
 
-- Windows以外の環境での`--debug_dataset` の動作を改善しました。[PR #429](https://github.com/kohya-ss/sd-scripts/pull/429) tsukimiya氏に感謝します。
-- `--face_crop_aug`オプションがFine tuning方式で動作しなかったのを修正しました。
-- `gen_img_diffusers.py`に任意のupscalerを利用するためのコード準備を行いました。
+- Added Chinese translation of [DreamBooth guide](./train_db_README-zh.md) and [LoRA guide](./train_network_README-zh.md). [PR #459](https://github.com/kohya-ss/sd-scripts/pull/459) Thanks to tomj2ee!
+- Added [documentation](./gen_img_README-ja.md) for image generation script `gen_img_diffusers.py` (Japanese version only).
+- 中国語版の[DreamBoothガイド](./train_db_README-zh.md)と[LoRAガイド](./train_network_README-zh.md)が追加されました。 [PR #459](https://github.com/kohya-ss/sd-scripts/pull/459) tomj2ee氏に感謝します。
+- 画像生成スクリプト `gen_img_diffusers.py`の簡単な[ドキュメント](./gen_img_README-ja.md)を追加しました（日本語版のみ）。 
+
+### 26 Apr. 2023, 2023/04/26
+
+- Added [Chinese translation](./train_README-zh.md) of training guide. [PR #445](https://github.com/kohya-ss/sd-scripts/pull/445) Thanks to tomj2ee!
+- `tag_images_by_wd14_tagger.py` can now get arguments from outside. [PR #453](https://github.com/kohya-ss/sd-scripts/pull/453) Thanks to mio2333!
+- 学習に関するドキュメントの[中国語版](./train_README-zh.md)が追加されました。 [PR #445](https://github.com/kohya-ss/sd-scripts/pull/445) tomj2ee氏に感謝します。
+- `tag_images_by_wd14_tagger.py`の引数を外部から取得できるようになりました。 [PR #453](https://github.com/kohya-ss/sd-scripts/pull/453) mio2333氏に感謝します。
+
+### 25 Apr. 2023, 2023/04/25
+
+- Please do not update for a while if you cannot revert the repository to the previous version when something goes wrong, because the model saving part has been changed.
+- Added `--save_every_n_steps` option to each training script. The model is saved every specified steps.
+  - `--save_last_n_steps` option can be used to save only the specified number of models (old models will be deleted).
+  - If you specify the `--save_state` option, the state will also be saved at the same time. You can specify the number of steps to keep the state with the `--save_last_n_steps_state` option (the same value as `--save_last_n_steps` is used if omitted).
+  - You can use the epoch-based model saving and state saving options together.
+  - Not tested in multi-GPU environment. Please report any bugs.
+- `--cache_latents_to_disk` option automatically enables `--cache_latents` option when specified. [#438](https://github.com/kohya-ss/sd-scripts/issues/438)
+- Fixed a bug in `gen_img_diffusers.py` where latents upscaler would fail with a batch size of 2 or more.
   
-### 19 Apr. 2023, 2023/4/19:
-- Fixed `lora_interrogator.py` not working. Please refer to [PR #392](https://github.com/kohya-ss/sd-scripts/pull/392) for details. Thank you A2va and heyalexchoi!
-- Fixed the handling of tags containing `_` in `tag_images_by_wd14_tagger.py`.
-- `lora_interrogator.py`が動作しなくなっていたのを修正しました。詳細は [PR #392](https://github.com/kohya-ss/sd-scripts/pull/392) をご参照ください。A2va氏およびheyalexchoi氏に感謝します。
-- `tag_images_by_wd14_tagger.py`で`_`を含むタグの取り扱いを修正しました。
+- モデル保存部分を変更していますので、何か不具合が起きた時にリポジトリを前のバージョンに戻せない場合には、しばらく更新を控えてください。
+- 各学習スクリプトに`--save_every_n_steps`オプションを追加しました。指定ステップごとにモデルを保存します。
+  - `--save_last_n_steps`オプションに数値を指定すると、そのステップ数のモデルのみを保存します（古いモデルは削除されます）。
+  - `--save_state`オプションを指定するとstateも同時に保存します。`--save_last_n_steps_state`オプションでstateを残すステップ数を指定できます（省略時は`--save_last_n_steps`と同じ値が使われます）。
+  - エポックごとのモデル保存、state保存のオプションと共存できます。
+  - マルチGPU環境でのテストを行っていないため、不具合等あればご報告ください。
+- `--cache_latents_to_disk`オプションが指定されたとき、`--cache_latents`オプションが自動的に有効になるようにしました。 [#438](https://github.com/kohya-ss/sd-scripts/issues/438)
+- `gen_img_diffusers.py`でlatents upscalerがバッチサイズ2以上でエラーとなる不具合を修正しました。
+
+
+Please read [Releases](https://github.com/kohya-ss/sd-scripts/releases) for recent updates.
+最近の更新情報は [Release](https://github.com/kohya-ss/sd-scripts/releases) をご覧ください。
 
 ### Naming of LoRA
 
@@ -189,31 +229,6 @@ To use LoRA-C3Liar with Web UI, please use our extension.
 LoRA-LierLa は[Web UI向け拡張](https://github.com/kohya-ss/sd-webui-additional-networks)、またはAUTOMATIC1111氏のWeb UIのLoRA機能で使用することができます。
 
 LoRA-C3Liarを使いWeb UIで生成するには拡張を使用してください。
-
-### 17 Apr. 2023, 2023/4/17:
-
-- Added the `--recursive` option to each script in the `finetune` folder to process folders recursively. Please refer to [PR #400](https://github.com/kohya-ss/sd-scripts/pull/400/) for details. Thanks to Linaqruf!
-- `finetune`フォルダ内の各スクリプトに再起的にフォルダを処理するオプション`--recursive`を追加しました。詳細は [PR #400](https://github.com/kohya-ss/sd-scripts/pull/400/) を参照してください。Linaqruf 氏に感謝します。
-
-### 14 Apr. 2023, 2023/4/14:
-- Fixed a bug that caused an error when loading DyLoRA with the `--network_weight` option in `train_network.py`.
-- `train_network.py`で、DyLoRAを`--network_weight`オプションで読み込むとエラーになる不具合を修正しました。
-
-### 13 Apr. 2023, 2023/4/13:
-
-- Added support for DyLoRA in `train_network.py`. Please refer to [here](./train_network_README-ja.md#dylora) for details (currently only in Japanese).
-- Added support for caching latents to disk in each training script. Please specify __both__ `--cache_latents` and `--cache_latents_to_disk` options.
-  - The files are saved in the same folder as the images with the extension `.npz`. If you specify the `--flip_aug` option, the files with `_flip.npz` will also be saved.
-  - Multi-GPU training has not been tested.
-  - This feature is not tested with all combinations of datasets and training scripts, so there may be bugs.
-- Added workaround for an error that occurs when training with `fp16` or `bf16` in `fine_tune.py`.
-
-- `train_network.py`でDyLoRAをサポートしました。詳細は[こちら](./train_network_README-ja.md#dylora)をご覧ください。
-- 各学習スクリプトでlatentのディスクへのキャッシュをサポートしました。`--cache_latents`オプションに __加えて__、`--cache_latents_to_disk`オプションを指定してください。
-  - 画像と同じフォルダに、拡張子 `.npz` で保存されます。`--flip_aug`オプションを指定した場合、`_flip.npz`が付いたファイルにも保存されます。
-  - マルチGPUでの学習は未テストです。
-  - すべてのDataset、学習スクリプトの組み合わせでテストしたわけではないため、不具合があるかもしれません。
-- `fine_tune.py`で、`fp16`および`bf16`の学習時にエラーが出る不具合に対して対策を行いました。
 
 ## Sample image generation during training
   A prompt file might look like this, for example
@@ -259,5 +274,3 @@ masterpiece, best quality, 1boy, in business suit, standing at street, looking b
 
   `( )` や `[ ]` などの重みづけも動作します。
 
-Please read [Releases](https://github.com/kohya-ss/sd-scripts/releases) for recent updates.
-最近の更新情報は [Release](https://github.com/kohya-ss/sd-scripts/releases) をご覧ください。
