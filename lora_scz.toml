@@ -3,11 +3,11 @@ enable_bucket = true                        # Aspect Ratio Bucketingを使うか
 
 [[datasets]]
 resolution = 512                            # 学習解像度
-batch_size = 7                              # バッチサイズ
+batch_size = 5                              # バッチサイズ
 
   [[datasets.subsets]]
-  image_dir = '/app/data/blue2'                     # 学習用画像を入れたフォルダを指定
-  class_tokens = 'spo gym uniform'                # identifier class を指定
+  image_dir = '/app/data/scz'                     # 学習用画像を入れたフォルダを指定
+  class_tokens = 'sch english cafe'                # identifier class を指定
   num_repeats = 15                          # 学習用画像の繰り返し回数
 
   # 以下は正則化画像を用いる場合のみ記述する。用いない場合は削除する

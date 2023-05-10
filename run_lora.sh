@@ -2,9 +2,9 @@
 
 accelerate launch --num_cpu_threads_per_process 1 train_network.py \
     --pretrained_model_name_or_path="/data/StableDiffusion/coremixpure_v10.safetensors" \
-    --dataset_config="lora_sch.toml" \
+    --dataset_config="lora_scz.toml" \
     --output_dir="/app/out/" \
-    --output_name="sch" \
+    --output_name="scz" \
     --save_model_as=safetensors \
     --prior_loss_weight=1.0 \
     --max_train_steps=1500 \
